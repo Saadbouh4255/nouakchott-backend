@@ -1,12 +1,13 @@
+require('dotenv').config();
 const express = require('express');
-const mysql = require('mysql2');
+const { Pool } = require('pg');
 const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 
 const app = express();
-const port = 3000;
+const port = 3007;
 
 app.use(cors());
 app.use(express.json());
@@ -18,67 +19,51 @@ if (!fs.existsSync(uploadsDir)) {
 }
 app.use('/uploads', express.static(uploadsDir));
 
-// Multer storage configuration for images
-const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        cb(null, 'uploads/');
-    },
-    filename: function (req, file, cb) {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, uniqueSuffix + path.extname(file.originalname));
-    }
-});
+// Use memory storage so nothing is saved locally on the hard drive
+const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
 // Database Connection
-const dbConfig = {
-    host: 'localhost',
-    user: 'root',
-    password: '',
-};
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+});
 
-let pool;
-
-// Initialize Database and Tables
+// Initialize Tables
 function initializeDatabase() {
-    const connection = mysql.createConnection(dbConfig);
-    connection.connect((err) => {
+    pool.connect((err, client, release) => {
         if (err) {
-            console.error('Error connecting to MySQL:', err);
+            console.error('Error connecting to PostgreSQL:', err.stack);
             return;
         }
-        console.log('Connected to MySQL server.');
+        console.log('Connected to PostgreSQL server.');
 
-        connection.query('CREATE DATABASE IF NOT EXISTS flutter_web', (err) => {
-            if (err) throw err;
-            console.log('Database "flutter_web" ready.');
+        const createTableQuery = `
+            CREATE TABLE IF NOT EXISTS places (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                description TEXT NOT NULL,
+                category VARCHAR(100) NOT NULL,
+                "imageUrl" TEXT NOT NULL,
+                "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `;
+
+        client.query(createTableQuery, (err) => {
+            if (err) {
+                console.error('Error creating table:', err.stack);
+                release();
+                return;
+            }
             
-            // Re-create pool with database selected
-            pool = mysql.createPool({
-                ...dbConfig,
-                database: 'flutter_web',
-                waitForConnections: true,
-                connectionLimit: 10,
-                queueLimit: 0
-            });
-
-            const createTableQuery = `
-                CREATE TABLE IF NOT EXISTS places (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    name VARCHAR(255) NOT NULL,
-                    description TEXT NOT NULL,
-                    category VARCHAR(100) NOT NULL,
-                    imageUrl VARCHAR(255) NOT NULL,
-                    createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            `;
-
-            pool.query(createTableQuery, (err) => {
-                if (err) throw err;
+            // Ensure imageUrl is TEXT to accommodate Base64 strings
+            client.query('ALTER TABLE places ALTER COLUMN "imageUrl" TYPE TEXT;', (err) => {
+                release();
+                if (err) {
+                    console.log('Note: Column type alteration skipped or failed:', err.message);
+                }
                 console.log('Table "places" is ready.');
             });
-            
-            connection.end();
         });
     });
 }
@@ -88,65 +73,64 @@ initializeDatabase();
 // --- API Endpoints ---
 
 // Get all places
-app.get('/api/places', (req, res) => {
-    pool.query('SELECT * FROM places ORDER BY createdAt DESC', (err, results) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(results);
-    });
+app.get('/api/places', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM places ORDER BY "createdAt" DESC');
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Get places by category
-app.get('/api/places/category/:category', (req, res) => {
-    const category = req.params.category;
-    pool.query('SELECT * FROM places WHERE category = ? ORDER BY createdAt DESC', [category], (err, results) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(results);
-    });
+app.get('/api/places/category/:category', async (req, res) => {
+    try {
+        const category = req.params.category;
+        const result = await pool.query('SELECT * FROM places WHERE category = $1 ORDER BY "createdAt" DESC', [category]);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Add a new place
-app.post('/api/places', upload.single('image'), (req, res) => {
-    const { name, description, category } = req.body;
-    
-    if (!req.file) {
-        return res.status(400).json({ error: 'Image file is required' });
-    }
+app.post('/api/places', upload.single('image'), async (req, res) => {
+    try {
+        const { name, description, category } = req.body;
 
-    const imageUrl = `http://localhost:${port}/uploads/${req.file.filename}`;
+        if (!req.file) {
+            return res.status(400).json({ error: 'Image file is required' });
+        }
 
-    const query = 'INSERT INTO places (name, description, category, imageUrl) VALUES (?, ?, ?, ?)';
-    pool.query(query, [name, description, category, imageUrl], (err, result) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.status(201).json({ 
-            message: 'Place added successfully', 
-            id: result.insertId,
+        // Convert file buffer to Base64 to store strictly in Supabase
+        const base64Image = req.file.buffer.toString('base64');
+        const mimeType = req.file.mimetype;
+        const imageUrl = `data:${mimeType};base64,${base64Image}`;
+
+        const query = 'INSERT INTO places (name, description, category, "imageUrl") VALUES ($1, $2, $3, $4) RETURNING id';
+
+        const result = await pool.query(query, [name, description, category, imageUrl]);
+        res.status(201).json({
+            message: 'Place added successfully',
+            id: result.rows[0].id,
             imageUrl: imageUrl
         });
-    });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Delete a place
-app.delete('/api/places/:id', (req, res) => {
-    const id = req.params.id;
+app.delete('/api/places/:id', async (req, res) => {
+    try {
+        const id = req.params.id;
 
-    // First get the image url to delete the file
-    pool.query('SELECT imageUrl FROM places WHERE id = ?', [id], (err, results) => {
-        if (err) return res.status(500).json({ error: err.message });
-        if (results.length > 0) {
-            const imageUrl = results[0].imageUrl;
-            const filename = imageUrl.split('/').pop();
-            const filePath = path.join(uploadsDir, filename);
-            if (fs.existsSync(filePath)) {
-                fs.unlinkSync(filePath);
-            }
-        }
-
-        // Then delete from database
-        pool.query('DELETE FROM places WHERE id = ?', [id], (err, result) => {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ message: 'Place deleted successfully' });
-        });
-    });
+        // Simply delete from database since images are stored as Base64 strings directly in Supabase
+        await pool.query('DELETE FROM places WHERE id = $1', [id]);
+        res.json({ message: 'Place deleted successfully' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.listen(port, () => {
