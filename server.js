@@ -45,6 +45,7 @@ function initializeDatabase() {
                 description TEXT NOT NULL,
                 category VARCHAR(100) NOT NULL,
                 "imageUrl" TEXT NOT NULL,
+                "mapsLien" TEXT,
                 "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `;
@@ -56,13 +57,20 @@ function initializeDatabase() {
                 return;
             }
             
-            // Ensure imageUrl is TEXT to accommodate Base64 strings
-            client.query('ALTER TABLE places ALTER COLUMN "imageUrl" TYPE TEXT;', (err) => {
-                release();
+            // Ensure mapsLien column exists
+            client.query('ALTER TABLE places ADD COLUMN IF NOT EXISTS "mapsLien" TEXT;', (err) => {
                 if (err) {
-                    console.log('Note: Column type alteration skipped or failed:', err.message);
+                    console.log('Note: Column mapsLien alteration failed:', err.message);
                 }
-                console.log('Table "places" is ready.');
+                
+                // Ensure imageUrl is TEXT to accommodate Base64 strings
+                client.query('ALTER TABLE places ALTER COLUMN "imageUrl" TYPE TEXT;', (err) => {
+                    release();
+                    if (err) {
+                        console.log('Note: Column type alteration skipped or failed:', err.message);
+                    }
+                    console.log('Table "places" is ready.');
+                });
             });
         });
     });
@@ -96,7 +104,7 @@ app.get('/api/places/category/:category', async (req, res) => {
 // Add a new place
 app.post('/api/places', upload.single('image'), async (req, res) => {
     try {
-        const { name, description, category } = req.body;
+        const { name, description, category, mapsLien } = req.body;
 
         if (!req.file) {
             return res.status(400).json({ error: 'Image file is required' });
@@ -107,13 +115,14 @@ app.post('/api/places', upload.single('image'), async (req, res) => {
         const mimeType = req.file.mimetype;
         const imageUrl = `data:${mimeType};base64,${base64Image}`;
 
-        const query = 'INSERT INTO places (name, description, category, "imageUrl") VALUES ($1, $2, $3, $4) RETURNING id';
+        const query = 'INSERT INTO places (name, description, category, "imageUrl", "mapsLien") VALUES ($1, $2, $3, $4, $5) RETURNING id';
 
-        const result = await pool.query(query, [name, description, category, imageUrl]);
+        const result = await pool.query(query, [name, description, category, imageUrl, mapsLien || '']);
         res.status(201).json({
             message: 'Place added successfully',
             id: result.rows[0].id,
-            imageUrl: imageUrl
+            imageUrl: imageUrl,
+            mapsLien: mapsLien || ''
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -128,6 +137,34 @@ app.delete('/api/places/:id', async (req, res) => {
         // Simply delete from database since images are stored as Base64 strings directly in Supabase
         await pool.query('DELETE FROM places WHERE id = $1', [id]);
         res.json({ message: 'Place deleted successfully' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Update a place
+app.put('/api/places/:id', upload.single('image'), async (req, res) => {
+    try {
+        const id = req.params.id;
+        const { name, description, category, mapsLien } = req.body;
+
+        let query = '';
+        let params = [];
+
+        if (req.file) {
+            const base64Image = req.file.buffer.toString('base64');
+            const mimeType = req.file.mimetype;
+            const imageUrl = `data:${mimeType};base64,${base64Image}`;
+
+            query = 'UPDATE places SET name = $1, description = $2, category = $3, "mapsLien" = $4, "imageUrl" = $5 WHERE id = $6';
+            params = [name, description, category, mapsLien || '', imageUrl, id];
+        } else {
+            query = 'UPDATE places SET name = $1, description = $2, category = $3, "mapsLien" = $4 WHERE id = $5';
+            params = [name, description, category, mapsLien || '', id];
+        }
+
+        await pool.query(query, params);
+        res.json({ message: 'Place updated successfully' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
